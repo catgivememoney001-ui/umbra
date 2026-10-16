@@ -129,7 +129,7 @@ function buildForest(world) {
   });
   // stone retaining wall on the right side
   const wallMat = pbr('stone', 1, { color: 0x77756f }, 'rock_wall_08');
-  const mossTop = pbr('moss', 2, { color: 0x8a9a70 });
+  const mossTex = pbr('moss', 2, { color: 0x8a9a70 });
   const stoneGeo = new RoundedBoxGeometry(0.62, 0.36, 0.5, 2, 0.08);
   const stones = [];
   const R = rng(17);
