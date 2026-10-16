@@ -460,6 +460,33 @@ export function loadTex(url, srgb = true) {
   });
 }
 
+/* loads awaited before a scene is shown */
+export const PENDING = [];
+const PH = 'https://dl.polyhaven.org/file/ph-assets/Models/';
+const atlasCache = {};
+/** Poly Haven model texture by short path, e.g. phTex('fir_tree_01/fir_tree_01_twig_diff') — returns a texture now, image arrives later */
+export function phTex(path, srgb = true, ext = 'jpg', fallback = null) {
+  const key = path + srgb + ext;
+  if (atlasCache[key]) return atlasCache[key];
+  const t = new THREE.Texture();
+  t.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+  t.wrapS = t.wrapT = THREE.RepeatWrapping; t.anisotropy = 8;
+  t.userData.keep = true;
+  const p = new Promise((res) => {
+    const fail = () => {
+      // offline: fall back to the procedural card (or plain white for alpha masks)
+      if (fallback === 'white') { const c = document.createElement('canvas'); c.width = c.height = 4; const g = c.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, 4, 4); t.image = c; }
+      else if (fallback) t.image = card(fallback).image;
+      t.needsUpdate = true; res(null);
+    };
+    loader.load(`${PH}${ext}/1k/${path}_1k.${ext}`, (src) => { t.image = src.image; t.needsUpdate = true; res(t); }, undefined, fail);
+  });
+  PENDING.push(p);
+  t.userData.ready = p;
+  atlasCache[key] = t;
+  return t;
+}
+
 const phCache = {};
 // Fetch a Poly Haven texture set through its public API; resolves null on failure.
 export function polyHaven(id) {
@@ -487,7 +514,7 @@ export function polyHaven(id) {
 
 /** Upgrade a material with an external set when it arrives; keeps repeat. */
 export function enhance(material, id, repeat = null) {
-  polyHaven(id).then((set) => {
+  PENDING.push(polyHaven(id).then((set) => {
     if (!set) return;
     const rep = repeat || (material.map ? material.map.repeat.clone() : new THREE.Vector2(1, 1));
     for (const k of ['map', 'normalMap', 'roughnessMap']) {
@@ -496,5 +523,5 @@ export function enhance(material, id, repeat = null) {
       material[k] = t;
     }
     material.needsUpdate = true;
-  });
+  }));
 }
