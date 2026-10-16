@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { Octree } from 'three/addons/math/Octree.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { Water } from 'three/addons/objects/Water.js';
-import { lib, card, rng, fbm, vnoise, tmath, enhance, loadTex, TEX_BASE, pbrSet } from './textures.js';
+import { lib, card, rng, fbm, vnoise, tmath, enhance, loadTex, TEX_BASE, pbrSet, phTex } from './textures.js';
 
 const { clamp, mix, smooth } = tmath;
 export const U = { time: { value: 0 } };
@@ -37,6 +37,7 @@ function addWorldVaryings(s) {
 /** Foliage wind sway (vertex). strength scaled with local height. */
 export function windSway(material, amount = 0.05, base = 1.5) {
   material.userData.key = (material.userData.key || '') + 'wind';
+  material.userData.windArgs = [amount, base];
   chain(material, (s) => {
     s.uniforms.uTime = U.time;
     s.vertexShader = 'uniform float uTime;\n' + s.vertexShader.replace('#include <begin_vertex>', `#include <begin_vertex>
@@ -116,6 +117,66 @@ export function wetRipples(material, intensity = 1, scale = 1.6) {
   return material;
 }
 
+/** Foliage: keep the authored (crown-radial) normal on both faces so cards light as a volume */
+export function foliageNormals(material) {
+  material.userData.key = (material.userData.key || '') + 'fol';
+  chain(material, (s) => {
+    s.fragmentShader = s.fragmentShader.replace('#include <normal_fragment_begin>', `#include <normal_fragment_begin>
+      normal = normalize(vNormal);`);
+  });
+  return material;
+}
+
+/** Shadows that respect alpha cut-outs (and wind) */
+export function alphaShadow(mesh) {
+  const m = mesh.material;
+  const o = { map: m.map, alphaMap: m.alphaMap, alphaTest: Math.max(m.alphaTest, 0.4), side: THREE.DoubleSide };
+  const d = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking, ...o });
+  const dd = new THREE.MeshDistanceMaterial(o);
+  if (m.userData.windArgs) { windSway(d, ...m.userData.windArgs); windSway(dd, ...m.userData.windArgs); }
+  mesh.customDepthMaterial = d; mesh.customDistanceMaterial = dd;
+  return mesh;
+}
+
+/** Moss / lichen on upward faces */
+export function mossTop(material, amount = 0.5, color = [0.09, 0.13, 0.06]) {
+  material.userData.key = (material.userData.key || '') + 'moss';
+  chain(material, (s) => {
+    addWorldVaryings(s);
+    s.fragmentShader = s.fragmentShader.replace('#include <color_fragment>', `#include <color_fragment>
+      float mo = smoothstep(0.35, 0.85, vWNorm.y + (fract(sin(dot(floor(vWPos.xz*6.0), vec2(12.9898,78.233)))*43758.5453)-0.5)*0.3) * ${amount.toFixed(2)};
+      diffuseColor.rgb = mix(diffuseColor.rgb, vec3(${color.map((v) => v.toFixed(3)).join(',')}), mo);`);
+  });
+  return material;
+}
+
+/**
+ * Distance-managed instancing: every few frames fills each level's meshes with the instances in its range.
+ * levels: [{ dist, meshes }] in increasing distance; instances beyond the last are culled (fog hides them).
+ */
+export function dynInstances(world, mats, pos, levels, { step = 0.35 } = {}) {
+  for (const L of levels) for (const m of L.meshes) { m.count = 0; m.frustumCulled = false; }
+  let acc = step, last = null;
+  const fogCut = () => { const f = world.scene.fog; return f && f.density ? Math.min(900, 2.7 / f.density) : 900; };
+  world.onUpdate((dt, ctx) => {
+    acc += dt;
+    const c = ctx.camera.getWorldPosition(_cam);
+    if (acc < step && last && last.distanceToSquared(c) < 4) return;
+    acc = 0; last = (last || new THREE.Vector3()).copy(c);
+    const cut = fogCut();
+    const counts = levels.map(() => 0);
+    for (let i = 0; i < mats.length; i++) {
+      const dx = pos[i].x - c.x, dz = pos[i].z - c.z, d = Math.sqrt(dx * dx + dz * dz);
+      if (d > cut) continue;
+      for (let l = 0; l < levels.length; l++) {
+        if (d < levels[l].dist) { const k = counts[l]++; for (const m of levels[l].meshes) m.setMatrixAt(k, mats[i]); break; }
+      }
+    }
+    levels.forEach((L, l) => { for (const m of L.meshes) { m.count = counts[l]; m.instanceMatrix.needsUpdate = true; } });
+  });
+}
+const _cam = new THREE.Vector3();
+
 /** Brightens rim to fake subsurface/translucency on leaves */
 export function translucent(material, color = 0x4a5a2a, k = 0.35) {
   chain(material, (s) => {
@@ -150,7 +211,7 @@ export function cardMat(name, extra = {}) {
 /* =========================================================
    Geometry helpers
    ========================================================= */
-export function taperedTube(points, radial, rFn, uScale = 1, vScale = 1, segsPerUnit = 2) {
+export function taperedTube(points, radial, rFn, uScale = 1, vScale = 1, segsPerUnit = 2, rough = 0, seed = 0) {
   const curve = new THREE.CatmullRomCurve3(points);
   const len = curve.getLength();
   const segs = Math.max(2, Math.ceil(len * segsPerUnit));
@@ -165,7 +226,9 @@ export function taperedTube(points, radial, rFn, uScale = 1, vScale = 1, segsPer
     for (let j = 0; j <= radial; j++) {
       const a = (j / radial) * Math.PI * 2;
       n.set(0, 0, 0).addScaledVector(N, Math.cos(a)).addScaledVector(B, Math.sin(a)).normalize();
-      pos.push(P.x + n.x * r, P.y + n.y * r, P.z + n.z * r);
+      // bark ridges & knots so silhouettes are never perfectly round
+      const rr = rough ? r * (1 + rough * ((vnoise((j / radial) * 8, t * len * 1.3, 8, seed) - 0.5) * 1.4 + (vnoise((j / radial) * 24, t * len * 0.35, 24, seed + 3) - 0.5) * 0.8)) : r;
+      pos.push(P.x + n.x * rr, P.y + n.y * rr, P.z + n.z * rr);
       nor.push(n.x, n.y, n.z);
       uv.push((j / radial) * uScale, (t * len) / vScale);
     }
@@ -179,6 +242,15 @@ export function taperedTube(points, radial, rFn, uScale = 1, vScale = 1, segsPer
   g.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3));
   g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
   g.setIndex(idx);
+  if (rough) {
+    g.computeVertexNormals();
+    const na = g.attributes.normal;
+    for (let i = 0; i <= segs; i++) { // weld seam normals
+      const a = i * (radial + 1), b = a + radial;
+      const x = na.getX(a) + na.getX(b), y = na.getY(a) + na.getY(b), z = na.getZ(a) + na.getZ(b), l = Math.hypot(x, y, z) || 1;
+      na.setXYZ(a, x / l, y / l, z / l); na.setXYZ(b, x / l, y / l, z / l);
+    }
+  }
   return g;
 }
 
@@ -245,6 +317,7 @@ export class World {
     this.envIntensity = 0.35;
     this.post = {};
     this.disposables = [];
+    this.pending = [];
   }
 
   collide(geometry, matrix = null) {
@@ -280,7 +353,7 @@ export class World {
   dispose() {
     const seen = new Set();
     this.scene.traverse((o) => {
-      if (o.geometry) o.geometry.dispose();
+      if (o.geometry && !o.geometry.userData.keep) o.geometry.dispose();
       const mats = o.material ? (Array.isArray(o.material) ? o.material : [o.material]) : [];
       for (const m of mats) {
         if (seen.has(m)) continue; seen.add(m);
@@ -462,143 +535,422 @@ function aoColors(g, fn) {
   g.setAttribute('color', new THREE.BufferAttribute(c, 3));
 }
 
-/** conifer variant: returns { trunk: geometry, foliage: geometry, height } (unit ~ 1 tree) */
-export function coniferGeometry(seed, h = 22, r0 = 0.45, crown = 3.8, sparse = 1) {
-  const R = rng(seed);
-  // trunk with flare + bark noise
-  const trunk = new THREE.CylinderGeometry(r0 * 0.12, r0, h, 12, 24, true);
-  trunk.translate(0, h / 2 - 0.6, 0);
-  const tp = trunk.attributes.position;
-  for (let i = 0; i < tp.count; i++) {
-    const x = tp.getX(i), y = tp.getY(i), z = tp.getZ(i);
-    const a = Math.atan2(z, x);
-    const flare = 1 + 1.3 * Math.exp(-Math.max(y, 0) * 1.6) * (0.75 + 0.25 * Math.sin(a * 5 + seed));
-    const nn = 1 + (vnoise(a * 3 + 10, y * 0.6, 64, seed) - 0.5) * 0.12;
-    tp.setXYZ(i, x * flare * nn, y, z * flare * nn);
+/* ---------- lightweight geometry builder ---------- */
+export class GB {
+  constructor() { this.p = []; this.n = []; this.u = []; this.c = []; this.i = []; }
+  v(x, y, z, nx, ny, nz, u, v, r, g = r, b = r) { this.p.push(x, y, z); this.n.push(nx, ny, nz); this.u.push(u, v); this.c.push(r, g, b); return this.p.length / 3 - 1; }
+  t(a, b, c) { this.i.push(a, b, c); }
+  build() {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(this.p, 3));
+    g.setAttribute('normal', new THREE.Float32BufferAttribute(this.n, 3));
+    g.setAttribute('uv', new THREE.Float32BufferAttribute(this.u, 2));
+    g.setAttribute('color', new THREE.Float32BufferAttribute(this.c, 3));
+    g.setIndex(this.i);
+    g.computeBoundingSphere();
+    return g;
   }
-  trunk.computeVertexNormals();
-  const tuv = trunk.attributes.uv;
-  for (let i = 0; i < tuv.count; i++) tuv.setXY(i, tuv.getX(i) * 2, tuv.getY(i) * h / 2.2);
+}
 
-  // foliage cards
-  const parts = [];
-  const start = h * (0.28 + R() * 0.08);
-  const whorls = Math.floor(30 * sparse);
-  for (let i = 0; i < whorls; i++) {
-    const t = i / whorls;
-    const y = start + (h - start) * t + R() * 0.3;
-    const rad = crown * Math.pow(1 - t, 0.9) * (0.75 + R() * 0.4) + 0.35;
-    const n = Math.max(3, Math.floor((5 + R() * 3) * (1 - t * 0.5)));
-    for (let k = 0; k < n; k++) {
-      if (R() < 0.12) continue;
-      const a = (k / n) * Math.PI * 2 + R() * 0.7 + i;
-      const len = rad * (0.85 + R() * 0.3);
-      const w = len * 0.75;
-      const g = bendPlane(w, len, 3, -0.05, 0.25 + R() * 0.15);
-      // lay mostly horizontal, drooping
-      g.rotateX(-Math.PI / 2 + 0.35 + R() * 0.25);
-      g.rotateY(-a + Math.PI / 2);
-      g.translate(0, y, 0);
-      aoColors(g, (x, yy, z) => 0.45 + 0.55 * clamp(Math.hypot(x, z) / len) * (0.6 + 0.4 * t));
-      parts.push(norm(g, true));
-      if (R() < 0.6) { // secondary vertical spray for volume
-        const g2 = bendPlane(w * 0.7, len * 0.8, 2, 0.1, 0.2);
-        g2.rotateX(-Math.PI / 2 + 0.9);
-        g2.rotateZ((R() - 0.5) * 0.6);
-        g2.rotateY(-a + Math.PI / 2 + 0.4);
-        g2.translate(0, y - 0.2, 0);
-        aoColors(g2, (x, yy, z) => 0.4 + 0.5 * clamp(Math.hypot(x, z) / len));
-        parts.push(norm(g2, true));
-      }
+/* Poly Haven fir_tree_01 twig atlas: rects in image space [x0, y0(top), x1, y1] */
+export const FIR = {
+  sprigs: [[0.656, 0.047, 0.934, 0.367], [0.191, 0.055, 0.414, 0.313], [0.313, 0.406, 0.637, 0.777], [0.637, 0.457, 0.949, 0.828]],
+  small: [0.5, 0.262, 0.625, 0.398],
+  bare: [0.316, 0.711, 0.98, 1.0],
+  strip: [0.02, 0.0, 0.19, 1.0],
+};
+export function firTex() {
+  return {
+    map: phTex('fir_tree_01/fir_tree_01_twig_diff', true, 'jpg', 'needles'), alpha: phTex('fir_tree_01/fir_tree_01_twig_alpha', false, 'jpg', 'white'),
+    bark: phTex('fir_tree_01/fir_tree_01_bark_diff', true, 'jpg', 'white'), barkN: phTex('fir_tree_01/fir_tree_01_bark_nor_gl', false), barkR: phTex('fir_tree_01/fir_tree_01_bark_rough', false),
+  };
+}
+
+const _a = new THREE.Vector3(), _b = new THREE.Vector3(), _n = new THREE.Vector3(), _qv = new THREE.Vector3(), UP = new THREE.Vector3(0, 1, 0);
+
+/**
+ * Photo card along direction D (stem → tip) spanning W, bent by `droop`.
+ * horiz: atlas rect runs left→right instead of bottom→top. normalFn(P) → outward normal for volumetric shading.
+ */
+export function card3(B, P, D, W, len, wid, rect, shade, normalFn, droop = 0.15, horiz = false, tint = [1, 1, 1]) {
+  const N0 = _n.crossVectors(W, D).normalize();
+  if (N0.y < 0) N0.negate();
+  const base = B.p.length / 3;
+  for (const r of [0, 0.5, 1]) for (const s of [-1, 1]) {
+    const px = P.x + D.x * len * r + W.x * wid * 0.5 * s - N0.x * droop * len * r * r;
+    const py = P.y + D.y * len * r + W.y * wid * 0.5 * s - N0.y * droop * len * r * r;
+    const pz = P.z + D.z * len * r + W.z * wid * 0.5 * s - N0.z * droop * len * r * r;
+    const nn = normalFn(px, py, pz, N0);
+    const a = (s + 1) / 2;
+    let u, v;
+    if (horiz) { u = rect[0] + (rect[2] - rect[0]) * r; v = (1 - rect[3]) + (rect[3] - rect[1]) * a; }
+    else { u = rect[0] + (rect[2] - rect[0]) * a; v = (1 - rect[3]) + (rect[3] - rect[1]) * r; }
+    const k = shade * (0.82 + 0.18 * r);
+    B.v(px, py, pz, nn.x, nn.y, nn.z, u, v, k * tint[0], k * tint[1], k * tint[2]);
+  }
+  for (let r = 0; r < 2; r++) { const a = base + r * 2; B.t(a, a + 2, a + 1); B.t(a + 1, a + 2, a + 3); }
+}
+
+/** thin tube using the bark strip of the atlas (same material as the needles → one draw call) */
+export function stick(B, pts, r0, r1, radial, rect, shade) {
+  const T = new THREE.Vector3(), Nn = new THREE.Vector3(), Bn = new THREE.Vector3();
+  const base = B.p.length / 3;
+  let acc = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const p = pts[i];
+    T.subVectors(pts[Math.min(i + 1, pts.length - 1)], pts[Math.max(i - 1, 0)]).normalize();
+    Nn.crossVectors(T, Math.abs(T.y) > 0.95 ? _qv.set(1, 0, 0) : UP).normalize();
+    Bn.crossVectors(Nn, T).normalize();
+    if (i) acc += p.distanceTo(pts[i - 1]);
+    const r = r0 + (r1 - r0) * (i / (pts.length - 1));
+    for (let j = 0; j <= radial; j++) {
+      const a = (j / radial) * Math.PI * 2, ca = Math.cos(a), sa = Math.sin(a);
+      const nx = Nn.x * ca + Bn.x * sa, ny = Nn.y * ca + Bn.y * sa, nz = Nn.z * ca + Bn.z * sa;
+      B.v(p.x + nx * r, p.y + ny * r, p.z + nz * r, nx, ny, nz, rect[0] + (rect[2] - rect[0]) * (j / radial), 0.5 + acc * 0.6, shade);
     }
   }
-  // top spike
-  const tip = bendPlane(0.9, 2.2, 2, 0.02, 0);
-  tip.translate(0, h - 1.6, 0);
-  aoColors(tip, () => 0.9);
-  parts.push(norm(tip, true));
-  const tip2 = tip.clone(); tip2.rotateY(Math.PI / 2); parts.push(norm(tip2, true));
-  const foliage = mergeGeometries(parts, false);
-  parts.forEach((p) => p.dispose());
-  return { trunk, foliage, height: h };
+  for (let i = 0; i < pts.length - 1; i++) for (let j = 0; j < radial; j++) {
+    const a = base + i * (radial + 1) + j, b = a + radial + 1;
+    B.t(a, b, a + 1); B.t(b, b + 1, a + 1);
+  }
+}
+
+/** conifer skeleton → { trunk, lod0, lod1, height, r0 } */
+export function coniferGeometry(seed, h = 22, r0 = 0.45, crown = 3.8, sparse = 1) {
+  const R = rng(seed);
+  // trunk: flared, ridged bark
+  const trunkG = (radial, segs) => {
+    const g = new THREE.CylinderGeometry(r0 * 0.1, r0, h, radial, segs, true);
+    g.translate(0, h / 2 - 0.6, 0);
+    const tp = g.attributes.position;
+    for (let i = 0; i < tp.count; i++) {
+      const x = tp.getX(i), y = tp.getY(i), z = tp.getZ(i);
+      const a = Math.atan2(z, x);
+      const flare = 1 + 1.4 * Math.exp(-Math.max(y + 0.6, 0) * 1.5) * (0.7 + 0.3 * Math.sin(a * 5 + seed));
+      const nn = 1 + (vnoise((a / Math.PI + 1) * 4, y * 0.5, 8, seed) - 0.5) * 0.14 + (vnoise((a / Math.PI + 1) * 12, y * 0.15, 24, seed + 1) - 0.5) * 0.08;
+      tp.setXYZ(i, x * flare * nn, y, z * flare * nn);
+    }
+    g.computeVertexNormals();
+    const tuv = g.attributes.uv;
+    for (let i = 0; i < tuv.count; i++) tuv.setXY(i, tuv.getX(i) * 3, (tp.getY(i) + 0.6) / 1.4);
+    return g;
+  };
+  const start = h * (0.3 + R() * 0.08);
+  const top = h - 0.4;
+  const cy = start + (top - start) * 0.42;
+  const normalFn = (x, y, z, N0) => {
+    _a.set(x, (y - cy) * 0.45, z).normalize();
+    return _b.copy(_a).multiplyScalar(0.72).addScaledVector(N0, 0.4).addScaledVector(UP, 0.25).normalize();
+  };
+  const trunkR = (y) => r0 * (1 - (y + 0.6) / h) * 0.95 + 0.03;
+  // skeleton
+  const branches = [];
+  let y = start;
+  let wi = 0;
+  while (y < top - 0.6) {
+    const t = (y - start) / (top - start);
+    const L = (crown * Math.pow(1 - t, 0.85) * (0.82 + R() * 0.3) + 0.35);
+    const n = 5 + Math.floor(R() * 3);
+    for (let k = 0; k < n; k++) {
+      if (R() > sparse + 0.05) continue;
+      const a = (k / n) * Math.PI * 2 + R() * 0.6 + wi * 0.9;
+      const pitch = THREE.MathUtils.lerp(-0.22, 0.4, t) + (R() - 0.5) * 0.25;
+      branches.push({ y, a, L: L * (0.85 + R() * 0.3), pitch, droop: THREE.MathUtils.lerp(0.32, 0.08, t) * (0.7 + R() * 0.6), t, seed: R() });
+    }
+    y += (0.42 + R() * 0.22) * (h / 22);
+    wi++;
+  }
+  const pathOf = (b, steps) => {
+    const d = new THREE.Vector3(Math.cos(b.a), 0, Math.sin(b.a));
+    const r = trunkR(b.y);
+    const pts = [];
+    for (let i = 0; i <= steps; i++) {
+      const s = i / steps;
+      pts.push(new THREE.Vector3(
+        d.x * (r + b.L * s), b.y + b.L * (Math.sin(b.pitch) * s - b.droop * s * s + 0.18 * s * s * s), d.z * (r + b.L * s)));
+    }
+    return pts;
+  };
+  const along = (pts, s) => { const f = s * (pts.length - 1), i = Math.min(Math.floor(f), pts.length - 2), k = f - i; return [new THREE.Vector3().lerpVectors(pts[i], pts[i + 1], k), new THREE.Vector3().subVectors(pts[i + 1], pts[i]).normalize()]; };
+  const sprigRect = (q) => FIR.sprigs[Math.floor(q * FIR.sprigs.length) % FIR.sprigs.length];
+  const aspect = (r) => (r[2] - r[0]) / (r[3] - r[1]);
+
+  const build = (lod) => {
+    const B = new GB();
+    const R2 = rng(seed * 7 + lod);
+    for (const b of branches) {
+      if (lod === 1 && R2() < 0.25) continue;
+      const pts = pathOf(b, 4);
+      const ao = 0.42 + 0.3 * b.t;
+      const tint = [0.92 + R2() * 0.12, 0.95 + R2() * 0.08, 0.9 + R2() * 0.08];
+      if (lod === 0) stick(B, pts, 0.012 + 0.03 * b.L / crown, 0.004, 4, FIR.strip, ao * 0.8);
+      const ds = lod === 0 ? 0.3 : 0.62;
+      const sz = lod === 0 ? 1 : 1.75;
+      const steps = Math.max(1, Math.floor(b.L * 0.85 / ds));
+      for (let i = 0; i < steps; i++) {
+        const s = 0.18 + (i / steps) * 0.78;
+        const [P, T] = along(pts, s);
+        const Wl = _qv.crossVectors(T, UP).normalize().clone();
+        for (const side of lod === 0 ? [-1, 1] : [(i % 2) * 2 - 1]) {
+          const D = new THREE.Vector3().copy(T).multiplyScalar(0.6).addScaledVector(Wl, side * 0.75).add(new THREE.Vector3(0, 0.06 + R2() * 0.1, 0)).normalize();
+          const roll = (R2() - 0.5) * 0.9;
+          const W = new THREE.Vector3().crossVectors(UP, D).normalize().applyAxisAngle(D, roll);
+          const rect = sprigRect(R2());
+          const len = (0.42 + R2() * 0.3) * sz * (0.75 + 0.25 * Math.min(1, b.L / 1.5));
+          card3(B, P, D, W, len, len * aspect(rect), rect, ao + 0.45 * s, normalFn, 0.12 + R2() * 0.1, false, tint);
+        }
+      }
+      // tip spray
+      const [Pt, Tt] = along(pts, 0.92);
+      const rect = sprigRect(R2());
+      const Wt = new THREE.Vector3().crossVectors(UP, Tt).normalize();
+      card3(B, Pt, Tt.clone().add(new THREE.Vector3(0, 0.12, 0)).normalize(), Wt, 0.7 * sz, 0.7 * sz * aspect(rect), rect, ao + 0.5, normalFn, 0.1, false, tint);
+    }
+    // leader
+    for (let k = 0; k < (lod === 0 ? 3 : 2); k++) {
+      const D = new THREE.Vector3((R2() - 0.5) * 0.25, 1, (R2() - 0.5) * 0.25).normalize();
+      const W = new THREE.Vector3(Math.cos(k * 2.1), 0, Math.sin(k * 2.1));
+      card3(B, new THREE.Vector3(0, top - 1.4, 0), D, W, 1.6, 1.6 * aspect(FIR.sprigs[2]), FIR.sprigs[2], 0.95, normalFn, 0.02);
+    }
+    if (lod === 0) {
+      // dead lower branches with bare twigs
+      for (let yy = 1.2; yy < start - 0.3; yy += 0.5 + R2() * 0.4) {
+        const nn = 1 + Math.floor(R2() * 3);
+        for (let k = 0; k < nn; k++) {
+          const a = R2() * 6.283, L = 0.35 + R2() * 0.9 * (yy / start + 0.3);
+          const d = new THREE.Vector3(Math.cos(a), -0.15 - R2() * 0.25, Math.sin(a)).normalize();
+          const p0 = new THREE.Vector3(Math.cos(a) * trunkR(yy), yy, Math.sin(a) * trunkR(yy));
+          const p1 = p0.clone().addScaledVector(d, L);
+          stick(B, [p0, p0.clone().lerp(p1, 0.5), p1], 0.018, 0.004, 3, FIR.strip, 0.45);
+          if (R2() < 0.7) {
+            const W = new THREE.Vector3().crossVectors(UP, d).normalize();
+            card3(B, p0.clone().lerp(p1, 0.35), d, W, L * 0.9, L * 0.9 * 0.42, FIR.bare, 0.6, (x, y2, z, N0) => N0, 0.05, true, [0.85, 0.8, 0.75]);
+          }
+        }
+      }
+    }
+    return B.build();
+  };
+  return { trunk: trunkG(16, 28), trunkLo: trunkG(8, 6), lod0: build(0), lod1: build(1), height: h, r0 };
 }
 
 /**
- * Scatter instanced conifers. places: [{x,z,s,ry}] ; collide within radius
+ * Scatter instanced conifers with distance LOD. places: [{x,z,s,ry}] ; colliders within collideR
  */
-export function conifers(world, places, { variants = 3, snow = 0, foliageColor = 0x7c8c74, barkPh = 'bark_brown_02', collideR = 70, h = 22, seed = 1, crown = 3.8 } = {}) {
-  const barkMat = pbr('bark', [1, 1], { color: 0xb7aea4 }, barkPh);
-  const folMat = cardMat('needles', { vertexColors: true, color: foliageColor, roughness: 0.9 });
-  windSway(folMat, 0.012, 6);
-  translucent(folMat, 0x5a6a3a, 1);
-  if (snow) { snowCover(folMat, snow, 0.15); snowCover(barkMat, snow * 0.6, 0.55); }
+export function conifers(world, places, { variants = 3, snow = 0, foliageColor = 0x7c8c74, collideR = 70, h = 22, seed = 1, crown = 3.8, near = 34 } = {}) {
+  const T = firTex();
+  const tc = new THREE.Color(foliageColor);
+  const barkMat = new THREE.MeshStandardMaterial({ map: T.bark, normalMap: T.barkN, roughnessMap: T.barkR, color: 0xb0aaa2, roughness: 1, normalScale: new THREE.Vector2(1.6, 1.6) });
+  const folMat = new THREE.MeshStandardMaterial({ map: T.map, alphaMap: T.alpha, alphaTest: 0.42, side: THREE.DoubleSide, vertexColors: true, color: tc, roughness: 0.82, metalness: 0 });
+  windSway(folMat, 0.008, 5);
+  foliageNormals(folMat);
+  translucent(folMat, 0x6a7a3a, 1.6);
+  if (snow) { snowCover(folMat, snow, 0.2); snowCover(barkMat, snow * 0.6, 0.55); }
   const geos = [];
-  for (let v = 0; v < variants; v++) geos.push(coniferGeometry(seed * 31 + v * 7, h * (0.85 + v * 0.12), 0.42 + v * 0.06, crown * (0.9 + v * 0.1), 1 - v * 0.08));
+  for (let v = 0; v < variants; v++) geos.push(coniferGeometry(seed * 31 + v * 7, h * (0.85 + v * 0.12), 0.42 + v * 0.06, crown * (0.9 + v * 0.1), 1 - v * 0.06));
   const buckets = geos.map(() => []);
   places.forEach((p, i) => buckets[i % variants].push(p));
   buckets.forEach((list, v) => {
     if (!list.length) return;
-    const tr = new THREE.InstancedMesh(geos[v].trunk, barkMat, list.length);
-    const fo = new THREE.InstancedMesh(geos[v].foliage, folMat, list.length);
+    const G = geos[v];
+    const mk = (geo, mat, shadowAlpha) => { const m = new THREE.InstancedMesh(geo, mat, list.length); m.castShadow = m.receiveShadow = true; if (shadowAlpha) alphaShadow(m); world.scene.add(m); return m; };
+    const L0 = [mk(G.trunk, barkMat), mk(G.lod0, folMat, true)];
+    const L1 = [mk(G.trunkLo, barkMat), mk(G.lod1, folMat, true)];
+    const mats = [], pos = [];
     list.forEach((p, i) => {
       const y = world.heightAt(p.x, p.z);
-      const m = mat4(p.x, y, p.z, p.ry ?? i * 2.39, p.s ?? 1);
-      tr.setMatrixAt(i, m); fo.setMatrixAt(i, m);
+      mats.push(mat4(p.x, y, p.z, p.ry ?? i * 2.39, p.s ?? 1)); pos.push(new THREE.Vector3(p.x, y, p.z));
       if (Math.hypot(p.x, p.z) < collideR || p.collide) {
         const s = p.s ?? 1;
-        const r = (0.42 + v * 0.06) * s * 1.15;
-        world.collide(new THREE.CylinderGeometry(r * 0.55, r, geos[v].height * s * 0.75, 8, 1, false), mat4(p.x, y + geos[v].height * s * 0.375 - 0.6, p.z));
+        const r = G.r0 * s * 1.15;
+        world.collide(new THREE.CylinderGeometry(r * 0.55, r, G.height * s * 0.75, 8, 1, false), mat4(p.x, y + G.height * s * 0.375 - 0.6, p.z));
       }
     });
-    tr.castShadow = fo.castShadow = true; tr.receiveShadow = fo.receiveShadow = true;
-    world.scene.add(tr, fo);
+    dynInstances(world, mats, pos, [{ dist: near, meshes: L0 }, { dist: Infinity, meshes: L1 }]);
+    world.disposables.push(G.trunk, G.trunkLo, G.lod0, G.lod1);
   });
-  geos.forEach((g) => world.disposables.push(g.trunk, g.foliage));
 }
 
 /** fern clump geometry (instanced) */
 export function ferns(world, places, { color = 0x7d8f62, snow = 0, scale = 1 } = {}) {
+  // Each fern: 12 fronds radiating from centre, each frond has a central rachis
+  // with 7 pairs of bent pinnae (sub-leaflets), giving real fern silhouette
+  const R0 = rng(42);
   const parts = [];
-  const n = 9;
-  for (let i = 0; i < n; i++) {
-    const g = bendPlane(0.42, 1.0, 5, 0.25, 0.55);
-    g.rotateX(-0.75 - (i % 3) * 0.12);
-    g.rotateY((i / n) * Math.PI * 2 + (i % 2) * 0.3);
-    aoColors(g, (x, y, z) => 0.35 + 0.65 * clamp(Math.hypot(x, z) / 0.9));
-    parts.push(norm(g, true));
+  const frondCount = 12;
+  for (let fi = 0; fi < frondCount; fi++) {
+    const angle = (fi / frondCount) * Math.PI * 2 + R0() * 0.4;
+    const lean = 0.7 + R0() * 0.3;         // lean-out angle
+    const rollA = (R0() - 0.5) * 0.6;       // roll around the frond axis
+    const frondLen = 0.85 + R0() * 0.35;
+    const pinnaPairs = 7;
+    for (let pi = 0; pi <= pinnaPairs; pi++) {
+      const t = pi / pinnaPairs;
+      // position along frond rachis (bent outward + slight droop)
+      const rx = Math.cos(angle) * frondLen * t * lean;
+      const rz = Math.sin(angle) * frondLen * t * lean;
+      const ry_pos = frondLen * t * (1 - lean * 0.5) - frondLen * t * t * 0.55;
+      if (pi === 0) continue; // skip base joint
+      // pinnae card: perpendicular to rachis direction, tilted outward
+      const pLen = frondLen * (1 - t) * 0.5 + 0.1;
+      const pWid = pLen * 0.22;
+      // rachis direction in xz-plane
+      const dx = Math.cos(angle), dz = Math.sin(angle);
+      // pinna direction: perpendicular to rachis + slight upward tilt
+      for (const side of [-1, 1]) {
+        const pax = -dz * side, paz = dx * side;
+        const droop = 0.18 + t * 0.12;
+        const g = new THREE.PlaneGeometry(pWid, pLen, 1, 3);
+        g.translate(0, pLen / 2, 0);
+        // bend pinna downward at tip
+        const pp = g.attributes.position;
+        for (let vi = 0; vi < pp.count; vi++) {
+          const vt = (pp.getY(vi)) / pLen;
+          pp.setZ(vi, pp.getZ(vi) - vt * vt * droop * pLen);
+        }
+        g.computeVertexNormals();
+        // orient: rotate so +Y aligns with pinna direction (outward), then tilt down
+        g.rotateX(-Math.PI * 0.5 + 0.35 + t * 0.2);   // droop from horizontal
+        g.rotateY(Math.atan2(paz, pax) - Math.PI / 2);
+        g.applyMatrix4(new THREE.Matrix4().setPosition(rx + pax * 0.08, ry_pos, rz + paz * 0.08));
+        aoColors(g, (x, y, z) => 0.25 + 0.75 * clamp(Math.hypot(x, z) / (frondLen + 0.2)));
+        parts.push(norm(g, true));
+      }
+    }
+    // tip card
+    const tg = bendPlane(0.14, 0.32, 3, 0.28, 0.12);
+    tg.rotateX(-lean + 0.2);
+    tg.rotateY(angle + Math.PI);
+    tg.applyMatrix4(new THREE.Matrix4().setPosition(
+      Math.cos(angle) * frondLen * lean, frondLen * (1 - lean * 0.5) - frondLen * 0.55, Math.sin(angle) * frondLen * lean));
+    aoColors(tg, (x, y, z) => 0.7 + 0.3 * clamp(y / 0.4));
+    parts.push(norm(tg, true));
   }
   const geo = mergeGeometries(parts, false);
   const mat = cardMat('fern', { vertexColors: true, color, roughness: 0.75 });
-  windSway(mat, 0.08, 0.2);
-  translucent(mat, 0x6a8a3a, 1.5);
+  windSway(mat, 0.06, 0.15);
+  translucent(mat, 0x6a8a3a, 1.8);
   if (snow) snowCover(mat, snow, 0.3);
   const im = new THREE.InstancedMesh(geo, mat, places.length);
   places.forEach((p, i) => im.setMatrixAt(i, mat4(p.x, p.y ?? world.heightAt(p.x, p.z) - 0.05, p.z, p.ry ?? i * 1.7, (p.s ?? 1) * scale)));
   im.castShadow = true; im.receiveShadow = true;
+  alphaShadow(im);
   world.scene.add(im);
   world.disposables.push(geo);
   return im;
 }
 
-/** crossed-quad clumps for grass / reeds */
-export function clumps(world, places, { tex = 'grass', color = 0x6f7a55, w = 0.8, h = 0.6, snow = 0, sway = 0.12, yOff = 0, frost = false } = {}) {
+/** crossed-quad clumps (bare twigs etc.); atlas:'firBare' maps the Poly Haven bare-twig photo */
+export function clumps(world, places, { tex = 'grass', color = 0x6f7a55, w = 0.8, h = 0.6, snow = 0, sway = 0.12, yOff = 0, frost = false, atlas = null, cards = 5, cast = false } = {}) {
   const parts = [];
-  for (let i = 0; i < 3; i++) {
-    const g = bendPlane(w, h, 2, 0.05, 0);
-    g.rotateY((i / 3) * Math.PI);
-    aoColors(g, (x, y) => 0.45 + 0.55 * clamp(y / h));
+  const R = rng(places.length + 7);
+  // Build each card as a proper curved blade strip (6 height segments, strong droop)
+  for (let i = 0; i < cards; i++) {
+    const segsH = 6;
+    const wVar = w * (0.75 + R() * 0.5);
+    const hVar = h * (0.8 + R() * 0.4);
+    const droop = 0.12 + R() * 0.22;    // natural blade arch
+    const lean = (R() - 0.5) * 0.55;    // random lean direction
+    const taper = 0.15 + R() * 0.2;     // tip narrowing
+    const g = new THREE.PlaneGeometry(wVar, hVar, 1, segsH);
+    const pos = g.attributes.position;
+    // Reshape: taper width toward tip, add forward curve and sideways lean
+    for (let vi = 0; vi < pos.count; vi++) {
+      const t = (pos.getY(vi) / hVar + 0.5);  // 0 at base, 1 at tip
+      const t2 = t * t;
+      // taper: narrower toward tip
+      const xScale = mix(1, taper, t);
+      pos.setX(vi, pos.getX(vi) * xScale);
+      // forward arch (curve outward from base)
+      pos.setZ(vi, pos.getZ(vi) + t2 * droop * hVar);
+      // sideways lean
+      pos.setX(vi, pos.getX(vi) + t2 * lean * wVar);
+    }
+    g.computeVertexNormals();
+    if (atlas) g.rotateZ((R() - 0.5) * 0.4);
+    g.rotateY((i / cards) * Math.PI + R() * 0.45);
+    aoColors(g, (x, y) => 0.3 + 0.7 * clamp(y / hVar + 0.5));
     parts.push(norm(g, true));
   }
   const geo = mergeGeometries(parts, false);
-  const mat = cardMat(tex, { vertexColors: true, color, roughness: 0.8 });
+  let mat;
+  if (atlas === 'firBare') {
+    const T = firTex(), r = FIR.bare;
+    const uv = geo.attributes.uv;
+    for (let i = 0; i < uv.count; i++) { const u = uv.getX(i), v = uv.getY(i); uv.setXY(i, r[0] + (r[2] - r[0]) * v, (1 - r[3]) + (r[3] - r[1]) * u); }
+    mat = new THREE.MeshStandardMaterial({ map: T.map, alphaMap: T.alpha, alphaTest: 0.4, side: THREE.DoubleSide, vertexColors: true, color, roughness: 0.9 });
+  } else mat = cardMat(tex, { vertexColors: true, color, roughness: 0.8 });
   windSway(mat, sway, 0.05);
+  translucent(mat, typeof color === 'number' ? color : 0x5a7a42, 1.3);
   if (snow) snowCover(mat, frost ? snow * 0.55 : snow, frost ? -0.6 : 0.0);
   const im = new THREE.InstancedMesh(geo, mat, places.length);
   places.forEach((p, i) => im.setMatrixAt(i, mat4(p.x, (p.y ?? world.heightAt(p.x, p.z)) + yOff, p.z, p.ry ?? i * 2.1, p.s ?? 1)));
   im.receiveShadow = true;
+  if (cast) { im.castShadow = true; alphaShadow(im); }
   world.scene.add(im);
   world.disposables.push(geo);
   return im;
+}
+
+/* Poly Haven grass_medium_02 blade photos [x0, y0(top), x1, y1] */
+const BLADES = [[0.031, 0.035, 0.164, 0.965], [0.91, 0.145, 0.957, 1], [0.148, 0.195, 0.25, 0.969], [0.672, 0.207, 0.711, 0.895], [0.359, 0.246, 0.406, 0.727], [0.555, 0.5, 0.633, 0.805], [0.809, 0.738, 0.855, 1], [0.449, 0.07, 0.605, 0.762]];
+
+/**
+ * Real grass: every blade is its own curved strip textured with a scanned blade.
+ * Use for lawns, verge grass, reeds (tall/upright) and moss tufts (tiny/dense).
+ */
+export function grass(world, places, { color = 0xc8c8b8, height = [0.25, 0.55], blades = 22, lean = 0.55, sway = 0.1, snow = 0, frost = false, near = 40, variants = 4, seed = 5, cast = false, dry = 0.3, spread = 0.2, widthK = 1, yOff = 0 } = {}) {
+  const map = phTex('grass_medium_02/grass_medium_02_diff', true, 'png', 'grass');
+  const mat = new THREE.MeshStandardMaterial({ map, alphaTest: 0.35, side: THREE.DoubleSide, vertexColors: true, color, roughness: 0.72, metalness: 0 });
+  windSway(mat, sway, 0.02);
+  foliageNormals(mat);
+  translucent(mat, 0x8a9a4a, 1.1);
+  if (snow) snowCover(mat, frost ? snow * 0.6 : snow, frost ? -0.5 : 0.15);
+  const geos = [];
+  const up = new THREE.Vector3(0, 1, 0);
+  for (let v = 0; v < variants; v++) {
+    const R = rng(seed * 13 + v), B = new GB();
+    for (let b = 0; b < blades; b++) {
+      const rect = BLADES[Math.floor(R() * BLADES.length)];
+      const hh = height[0] + (height[1] - height[0]) * Math.pow(R(), 0.8);
+      const ang = R() * 6.283, r0 = Math.sqrt(R()) * spread;
+      const bx = Math.cos(ang) * r0, bz = Math.sin(ang) * r0;
+      const a2 = ang + (R() - 0.5) * 1.4;
+      const ox = Math.cos(a2), oz = Math.sin(a2);
+      const lb = lean * (0.25 + R() * 0.75);
+      const w = Math.min(0.06, hh * (rect[2] - rect[0]) / (rect[3] - rect[1])) * widthK * (0.8 + R() * 0.4);
+      const tw = (R() - 0.5) * 1.2;
+      const Wx = -oz * Math.cos(tw) + ox * Math.sin(tw) * 0.3, Wz = ox * Math.cos(tw) + oz * Math.sin(tw) * 0.3;
+      const dryk = R() < dry ? [1.18, 1.02, 0.72] : [0.9 + R() * 0.1, 1, 0.86];
+      const base = B.p.length / 3;
+      for (let i = 0; i <= 4; i++) {
+        const t = i / 4;
+        const out = Math.sin(lb) * hh * t + lb * 0.7 * hh * t * t;
+        const py = hh * t * (1 - 0.4 * lb * t);
+        const nx = ox * 0.45, ny = 0.85, nz = oz * 0.45;
+        const sh = 0.3 + 0.7 * t;
+        for (const s of [-1, 1]) {
+          B.v(bx + ox * out + Wx * w * 0.5 * s, py, bz + oz * out + Wz * w * 0.5 * s, nx, ny, nz,
+            rect[0] + (rect[2] - rect[0]) * (s + 1) / 2, (1 - rect[3]) + (rect[3] - rect[1]) * t, sh * dryk[0], sh * dryk[1], sh * dryk[2]);
+        }
+      }
+      for (let i = 0; i < 4; i++) { const a = base + i * 2; B.t(a, a + 2, a + 1); B.t(a + 1, a + 2, a + 3); }
+    }
+    geos.push(B.build());
+  }
+  const lists = geos.map(() => []);
+  places.forEach((p, i) => lists[i % geos.length].push(p));
+  lists.forEach((list, v) => {
+    if (!list.length) return;
+    const im = new THREE.InstancedMesh(geos[v], mat, list.length);
+    im.receiveShadow = true;
+    if (cast) { im.castShadow = true; alphaShadow(im); }
+    world.scene.add(im);
+    const mats = [], pos = [];
+    list.forEach((p, i) => { const y = (p.y ?? world.heightAt(p.x, p.z)) + yOff; mats.push(mat4(p.x, y, p.z, p.ry ?? i * 2.1, p.s ?? 1)); pos.push(new THREE.Vector3(p.x, y, p.z)); });
+    dynInstances(world, mats, pos, [{ dist: near, meshes: [im] }]);
+  });
+  world.disposables.push(...geos);
 }
 
 /** displaced rock geometry */
@@ -653,42 +1005,46 @@ export function rocks(world, places, { color = 0x9a978f, mossy = 0.4, snow = 0, 
   world.disposables.push(...geos, ...col);
 }
 
-/** branching tree (oak / bare) — unique geometry */
+/* Poly Haven tree_small_02 leaf-twig photo regions */
+const LEAF_RECTS = [[0.0, 0.0, 0.58, 0.5], [0.0, 0.5, 0.44, 1.0]];
+function leafTex() { return { map: phTex('tree_small_02/tree_small_02_leaves_diff', true, 'jpg', 'leaves'), alpha: phTex('tree_small_02/tree_small_02_leaves_alpha', false, 'jpg', 'white') }; }
+
+/** branching tree (oak / bare) — unique geometry with ridged bark, photo leaves / twigs */
 export function branchTree(world, x, z, opts = {}) {
   const {
     seed = 1, height = 7, trunkR = 0.45, spread = 1, depth = 4, horizontal = 0.3, leaves = false, moss = false,
-    snow = 0, barkColor = 0x9a948c, leafColor = 0x6a7a55, mossColor = 0x9aa08a, collide = true, lean = 0, ry = 0, merger = null, twigs = false,
+    snow = 0, barkColor = 0x9a948c, leafColor = 0x6a7a55, mossColor = 0x9aa08a, collide = true, lean = 0, ry = 0, twigs = false, leafDensity = 5,
   } = opts;
   const R = rng(seed);
   const y0 = world.heightAt(x, z) - 0.3;
-  const bark = pbr('bark', 1, { color: barkColor }, 'bark_brown_02');
+  const bark = pbr('bark', 1, { color: barkColor, normalScale: new THREE.Vector2(1.8, 1.8) }, 'bark_brown_02');
+  if (moss) mossTop(bark, 0.6, [0.1, 0.12, 0.07]);
   if (snow) snowCover(bark, snow, 0.35);
   const M = new Merger();
-  const leafPos = [], mossPos = [];
+  const tips = [], mossPos = [], mids = [];
   const colStart = world.colliderGeoms.length;
-  const grow =(start, dir, len, r, d) => {
+  const grow = (start, dir, len, r, d) => {
     const pts = [start.clone()];
     const cur = start.clone(), dd = dir.clone();
-    const steps = 4;
+    const steps = 4 + (d < 2 ? 2 : 0);
     for (let i = 1; i <= steps; i++) {
-      dd.x += (R() - 0.5) * 0.35; dd.z += (R() - 0.5) * 0.35;
-      dd.y += (d < depth ? -0.04 * (depth - d) * horizontal : 0) + (R() - 0.5) * 0.15;
+      dd.x += (R() - 0.5) * 0.3; dd.z += (R() - 0.5) * 0.3;
+      dd.y += (d < depth ? -0.04 * (depth - d) * horizontal : 0) + (R() - 0.5) * 0.14;
       dd.normalize();
       cur.addScaledVector(dd, len / steps);
       pts.push(cur.clone());
     }
     const rEnd = r * 0.55;
-    const g = taperedTube(pts, Math.max(5, Math.round(10 * r / trunkR) + 3), (t) => mix(r, rEnd, t) * (1 + (t < 0.05 && d === 0 ? 0.6 : 0)), 2, 2.2, 2);
+    const radial = Math.max(6, Math.round(16 * r / trunkR) + 4);
+    const g = taperedTube(pts, radial, (t) => mix(r, rEnd, t) * (1 + (t < 0.06 && d === 0 ? 0.7 * (1 - t / 0.06) : 0)), 2, 2.2, d < 2 ? 3 : 2, d < 2 ? 0.14 : 0.07, seed * 10 + d);
     M.add(g, null, bark);
     if (collide && r > 0.13 && d <= 2) {
       const cg = taperedTube(pts, 6, (t) => mix(r, rEnd, t), 1, 1, 1);
       world.collide(cg); cg.dispose();
     }
     g.dispose();
-    if (d >= depth) {
-      leafPos.push(cur.clone());
-      return;
-    }
+    if (d >= 2) mids.push({ p: pts[Math.floor(pts.length / 2)].clone(), d: dd.clone() });
+    if (d >= depth) { tips.push({ p: cur.clone(), d: dd.clone() }); return; }
     if (moss && d >= 1 && r < trunkR * 0.7) for (let k = 0; k < 2; k++) mossPos.push(new THREE.Vector3().lerpVectors(pts[1], cur, R()));
     const kids = d === 0 ? 3 + Math.floor(R() * 2) : 2 + Math.floor(R() * 2);
     for (let k = 0; k < kids; k++) {
@@ -702,27 +1058,43 @@ export function branchTree(world, x, z, opts = {}) {
   const group = new THREE.Group();
   group.position.set(x, y0, z); group.rotation.y = ry;
   M.build(group);
-  // leaves
-  if (leaves && leafPos.length) {
-    const mat = cardMat('leaves', { color: leafColor, vertexColors: true });
-    windSway(mat, 0.03, 2);
-    translucent(mat, 0x6a7a3a, 1.2);
-    for (const p of leafPos) for (let k = 0; k < 3; k++) {
-      const s = 1.6 + R() * 1.4;
-      const g = new THREE.PlaneGeometry(s, s);
-      aoColors(g, () => 0.5 + R() * 0.5);
-      M.add(g, mat4(p.x + (R() - 0.5), p.y + (R() - 0.5) * 0.6, p.z + (R() - 0.5), R() * 6, 1, 1, 1, R() * 3, R()), mat, true);
+  const crownC = tips.reduce((c, t) => c.add(t.p), new THREE.Vector3()).divideScalar(Math.max(1, tips.length));
+  const radialN = (px, py, pz, N0) => {
+    const a = new THREE.Vector3(px - crownC.x, (py - crownC.y) * 0.7, pz - crownC.z).normalize();
+    return a.multiplyScalar(0.75).addScaledVector(N0, 0.35).add(new THREE.Vector3(0, 0.2, 0)).normalize();
+  };
+  const addCards = (B, mat) => { const g = B.build(); const m = new THREE.Mesh(g, mat); m.castShadow = m.receiveShadow = true; alphaShadow(m); group.add(m); return m; };
+  if (leaves && tips.length) {
+    const T = leafTex();
+    const mat = new THREE.MeshStandardMaterial({ map: T.map, alphaMap: T.alpha, alphaTest: 0.45, side: THREE.DoubleSide, vertexColors: true, color: leafColor, roughness: 0.7 });
+    windSway(mat, 0.025, 2); foliageNormals(mat); translucent(mat, 0x7a8a3a, 1.4);
+    if (snow) snowCover(mat, snow, 0.3);
+    const B = new GB();
+    for (const t of [...tips, ...mids.filter(() => R() < 0.4)]) for (let k = 0; k < leafDensity; k++) {
+      const D = t.d.clone().add(new THREE.Vector3((R() - 0.5) * 1.6, (R() - 0.3) * 1.0, (R() - 0.5) * 1.6)).normalize();
+      const W = new THREE.Vector3().crossVectors(new THREE.Vector3(0, 1, 0), D).normalize().applyAxisAngle(D, (R() - 0.5) * 1.6);
+      const rect = LEAF_RECTS[Math.floor(R() * 2)];
+      const len = 0.9 + R() * 0.8;
+      const P = t.p.clone().addScaledVector(D, -len * 0.25);
+      const sh = 0.55 + R() * 0.35;
+      card3(B, P, D, W, len, len * (rect[2] - rect[0]) / (rect[3] - rect[1]), rect, sh, radialN, 0.12, false, [0.95 + R() * 0.1, 1, 0.92 + R() * 0.1]);
     }
-    M.build(group, { cast: true });
+    addCards(B, mat);
   }
-  if (twigs && leafPos.length) {
-    const mat = cardMat('twigs', { color: 0x8a8580, alphaTest: 0.35 });
-    if (snow) snowCover(mat, snow * 0.55, -0.6);
-    for (const p of leafPos) for (let k = 0; k < 2; k++) {
-      const s = 1.4 + R();
-      M.add(new THREE.PlaneGeometry(s, s), mat4(p.x, p.y + s * 0.35, p.z, R() * 6, 1, 1, 1, (R() - 0.5) * 0.5, 0), mat);
+  if (twigs && tips.length) {
+    const T = firTex();
+    const mat = new THREE.MeshStandardMaterial({ map: T.map, alphaMap: T.alpha, alphaTest: 0.4, side: THREE.DoubleSide, vertexColors: true, color: 0x9a948c, roughness: 0.9 });
+    windSway(mat, 0.015, 2);
+    if (snow) snowCover(mat, snow * 0.6, -0.4);
+    const B = new GB();
+    const flat = (px, py, pz, N0) => N0;
+    for (const t of [...tips, ...mids]) for (let k = 0; k < 3; k++) {
+      const D = t.d.clone().add(new THREE.Vector3((R() - 0.5) * 1.2, R() * 0.6, (R() - 0.5) * 1.2)).normalize();
+      const W = new THREE.Vector3().crossVectors(new THREE.Vector3(0, 1, 0), D).normalize().applyAxisAngle(D, (R() - 0.5) * 2.5);
+      const len = 0.7 + R() * 0.7;
+      card3(B, t.p, D, W, len, len * 0.42, FIR.bare, 0.75 + R() * 0.25, flat, 0.05, true, [1, 0.96, 0.92]);
     }
-    M.build(group);
+    addCards(B, mat);
   }
   if (moss && mossPos.length) {
     const mat = cardMat('mossStrand', { color: mossColor, alphaTest: 0.3, roughness: 1 });
@@ -734,13 +1106,13 @@ export function branchTree(world, x, z, opts = {}) {
       const g2 = new THREE.PlaneGeometry(w, l, 1, 4); g2.translate(0, -l / 2, 0);
       M.add(g2, mat4(p.x, p.y, p.z, R() * 6 + 1.57), mat);
     }
-    M.build(group, { cast: true });
+    M.build(group, { cast: true }).forEach((m) => alphaShadow(m));
   }
   world.scene.add(group);
   // colliders were added in local space: move them into place
   group.updateMatrix();
   for (let i = colStart; i < world.colliderGeoms.length; i++) world.colliderGeoms[i].applyMatrix4(group.matrix);
-  return { group, leafPos: leafPos.map((p) => p.clone().applyMatrix4(group.matrix)) };
+  return { group, leafPos: tips.map((t) => t.p.clone().applyMatrix4(group.matrix)) };
 }
 
 /* =========================================================

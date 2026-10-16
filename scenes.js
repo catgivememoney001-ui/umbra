@@ -3,8 +3,32 @@ import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.j
 import {
   World, U, sky, terrain, pathSampler, ribbon, conifers, ferns, clumps, rocks, branchTree, streetLamp, glowSprite,
   rain, snowfall, mist, water, boundary, fireflies, footprintSystem, dustMotes, pbr, cardMat, Merger, mat4, taperedTube,
-  wetRipples, snowCover, windSway, hangSway, clamp, mix, smooth, fbm, vnoise, rng, card,
+  wetRipples, snowCover, windSway, hangSway, clamp, mix, smooth, fbm, vnoise, rng, card, grass, mossTop,
 } from './world.js';
+import { modelInstances, placeModel } from './models.js';
+
+/* scanned ground cover shared by the woodland scenes */
+function fernsM(world, places, { scale = 2, tint = 0xb0b8a0, snow = 0, far = 48 } = {}) {
+  // primary: Poly Haven fern_02 scanned model; secondary: fern_01 as fallback variety
+  modelInstances(world, 'fern_02', places.filter((_, i) => i % 3 !== 0), { scale, tint, wind: [0.05, 0.05], translucent: 0x6a8a3a, snow, far, sink: 0.04, onFail: () => ferns(world, places, { scale: scale * 0.5 }) });
+  modelInstances(world, 'fern_01', places.filter((_, i) => i % 3 === 0), { scale: scale * 0.85, tint: new THREE.Color(tint).multiplyScalar(0.9).getHex(), wind: [0.04, 0.04], translucent: 0x5a7a2a, snow, far, sink: 0.03, onFail: () => ferns(world, places.filter((_, i) => i % 3 === 0), { scale: scale * 0.45 }) });
+}
+function rocksM(world, places, { id = 'rock_moss_set_02', scale = 0.7, tint = 0xb4b2aa, snow = 0, moss = 0, sink = 0.28 } = {}) {
+  modelInstances(world, id, places, { scale, tint, snow, moss, sink, collide: 'auto', minCollide: 0.6, normalScale: 1.3, onFail: () => rocks(world, places, { mossy: 0.6, snow }) });
+}
+/** Scatter small ground-cover plants (wood sorrel, clover, moss tufts) */
+function groundCover(world, places, { snow = 0, tint = 0xb2b8a8 } = {}) {
+  const halfA = places.filter((_, i) => i % 2 === 0);
+  const halfB = places.filter((_, i) => i % 2 !== 0);
+  modelInstances(world, 'woodland_moss_01', halfA, { scale: 0.6, tint, snow, far: 30, sink: 0.02, wind: [0.02, 0.01], onFail: () => {} });
+  modelInstances(world, 'ground_plants_01', halfB, { scale: 0.5, tint, snow, far: 28, sink: 0.02, wind: [0.03, 0.01], onFail: () => {} });
+}
+function deadwood(world, area, ok, seed, { snow = 0, logs = 5, stumps = 4, sticks = 70, tint = 0xa8a49c } = {}) {
+  modelInstances(world, 'dead_tree_trunk', scatter(logs, seed, area, ok), { scale: 1.7, sink: 0.22, collide: 'log', tint, snow, moss: snow ? 0 : 0.35, tilt: 0.06 });
+  modelInstances(world, 'tree_stump_01', scatter(Math.ceil(stumps / 2), seed + 1, area, ok), { scale: 1.1, sink: 0.12, collide: 'cyl', tint, snow, moss: snow ? 0 : 0.3 });
+  modelInstances(world, 'tree_stump_02', scatter(Math.floor(stumps / 2), seed + 2, area, ok), { scale: 1.1, sink: 0.12, collide: 'cyl', tint, snow, moss: snow ? 0 : 0.3 });
+  modelInstances(world, 'dry_branches_medium_01', scatter(sticks, seed + 3, area * 0.8, ok).map((p) => ({ ...p, s: p.s * 1.4 })), { sink: 0.15, tint, snow, far: 40, cast: false });
+}
 
 /* ---------- helpers ---------- */
 function bake(fn, size, res, cx = 0, cz = 0) {
@@ -127,7 +151,7 @@ function buildForest(world) {
   S.add(sim);
   // moss on top of the wall
   const mossPlaces = curbOff.filter(({ p }) => p.z > -55 && p.z < 62).map(({ p, n }) => ({ x: p.x + n[0] * 3.25, z: p.z + n[1] * 3.25, y: H(p.x, p.z) + 1.08, s: 0.8 }));
-  clumps(world, mossPlaces, { tex: 'grass', color: 0x5a6a40, w: 1.2, h: 0.35 });
+  grass(world, mossPlaces.flatMap((p) => [p, { ...p, x: p.x + 0.25, z: p.z + 0.2 }]), { height: [0.05, 0.16], blades: 34, spread: 0.45, lean: 1.0, color: 0x9aa070, dry: 0.1, sway: 0.03, near: 45 });
 
   /* cabin */
   buildCabin(world, -12.5, 4.5, H(-12.5, 4.5), 2.3);
@@ -152,9 +176,25 @@ function buildForest(world) {
   conifers(world, [...near, ...far], { variants: 3, collideR: 75, foliageColor: 0x7d8c76, seed: 2 });
   // big hero trunks framing the road
   conifers(world, [{ x: -6.6, z: -1.2, s: 1.35 }, { x: -9.5, z: -9, s: 1.25 }, { x: 9.5, z: 12, s: 1.3 }, { x: 11, z: -12, s: 1.2 }], { variants: 2, collideR: 999, seed: 9, h: 26 });
-  ferns(world, scatter(520, 5, 140, (x, z) => { const d = road.dist(x, z)[0]; return d > 3.4 && Math.hypot(x + 12.5, z - 4.5) > 5.5; }), { color: 0x7a8c5e });
-  clumps(world, scatter(500, 6, 120, (x, z) => { const d = road.dist(x, z)[0]; return d > 2.9 && d < 9; }), { tex: 'grass', color: 0x5d6b45, w: 0.7, h: 0.45 });
-  rocks(world, scatter(40, 7, 120, (x, z) => road.dist(x, z)[0] > 6), { mossy: 0.7 });
+  // dense fern carpet covering the forest floor
+  fernsM(world, scatter(700, 5, 140, (x, z) => { const d = road.dist(x, z)[0]; return d > 3.4 && Math.hypot(x + 12.5, z - 4.5) > 5.5; }));
+  // Poly Haven shrubs: two species for variety
+  modelInstances(world, 'shrub_01', scatter(90, 51, 120, (x, z) => road.dist(x, z)[0] > 5), { scale: 0.9, tint: 0x9aaa88, wind: [0.04, 0.05], translucent: 0x6a8a3a, far: 55, sink: 0.06 });
+  modelInstances(world, 'shrub_02', scatter(80, 52, 110, (x, z) => road.dist(x, z)[0] > 4.5), { scale: 0.7, tint: 0x8a9878, wind: [0.03, 0.04], translucent: 0x5a7a3a, far: 50, sink: 0.05 });
+  // ground cover layer: moss patches
+  modelInstances(world, 'forest_floor_01', scatter(200, 53, 100, (x, z) => road.dist(x, z)[0] > 3.5), { scale: 1.2, tint: 0x8a9a78, far: 25, sink: 0.0, cast: false });
+  // ivy covering ground near walls and trees
+  modelInstances(world, 'ivy_01', scatter(70, 54, 80, (x, z) => road.dist(x, z)[0] > 5), { scale: 1.1, tint: 0x7a9068, far: 30, sink: 0.0, wind: [0.02, 0.01], cast: false });
+  // dense woodland grasses (both near road edge and deep forest)
+  grass(world, scatter(900, 6, 120, (x, z) => { const d = road.dist(x, z)[0]; return d > 2.8 && d < 10; }), { height: [0.2, 0.55], blades: 26, color: 0xb4b8a2, dry: 0.35 });
+  grass(world, scatter(600, 55, 110, (x, z) => road.dist(x, z)[0] > 10), { height: [0.15, 0.4], blades: 20, color: 0xa8ae9a, dry: 0.5, spread: 0.18 });
+  // mossy clumps and small plants in clusters
+  clumps(world, scatter(350, 56, 100, (x, z) => road.dist(x, z)[0] > 4.5), { tex: 'fern', color: 0x7a9068, w: 0.5, h: 0.7, sway: 0.07 });
+  rocksM(world, scatter(50, 7, 120, (x, z) => road.dist(x, z)[0] > 6), { moss: 0.65 });
+  rocksM(world, scatter(12, 77, 110, (x, z) => road.dist(x, z)[0] > 9), { id: 'rock_moss_set_01', scale: 0.8, sink: 0.3, moss: 0.7 });
+  // larger boulders as scene anchors
+  modelInstances(world, 'boulder_01', scatter(6, 57, 80, (x, z) => road.dist(x, z)[0] > 8), { scale: 1.4, sink: 0.3, collide: 'auto', moss: 0.8, tint: 0x949090 });
+  deadwood(world, 110, (x, z) => road.dist(x, z)[0] > 5 && Math.hypot(x + 12.5, z - 4.5) > 7, 600);
   boundary(world, 0, 0, 70);
 
   rain(world, { count: 10000, opacity: 0.28 });
@@ -279,25 +319,39 @@ function buildRiver(world) {
   oakSpots.forEach(([x, z, side], i) => {
     branchTree(world, x, z, {
       seed: 40 + i, height: 9 + R() * 4, trunkR: 0.5 + R() * 0.25, depth: 4, horizontal: 0.9, spread: 1.3, lean: -side * 0.35,
-      leaves: true, moss: true, leafColor: 0x5e6a4c, mossColor: 0x8e8e86, barkColor: 0x6e6a64, ry: R() * 6,
+      leaves: true, moss: true, leafColor: 0x5e6a4c, mossColor: 0x8e8e86, barkColor: 0x6e6a64, ry: R() * 6, leafDensity: 11,
     });
   });
   // the fallen branch across the water
   const logPts = [new THREE.Vector3(cX(6) - 10, 0.4, 3), new THREE.Vector3(cX(6) - 3, 0.25, 5.5), new THREE.Vector3(cX(6) + 3, 0.2, 7), new THREE.Vector3(cX(6) + 9, 0.55, 9.5)];
-  const logG = taperedTube(logPts, 12, (t) => mix(0.42, 0.22, t), 2, 2.2, 3);
-  const bark = pbr('bark', 1, { color: 0x5a5650 }, 'bark_brown_02');
+  const logG = taperedTube(logPts, 20, (t) => mix(0.42, 0.22, t), 2, 2.2, 4, 0.12, 9);
+  const bark = pbr('bark', 1, { color: 0x5a5650, normalScale: new THREE.Vector2(1.8, 1.8) }, 'bark_brown_02');
+  mossTop(bark, 0.7, [0.1, 0.12, 0.07]);
   const log = new THREE.Mesh(logG, bark); log.castShadow = log.receiveShadow = true; S.add(log);
   world.collide(taperedTube(logPts, 8, (t) => mix(0.42, 0.22, t), 1, 1, 2));
   // twisting dead branch sticking up from water
   const twig = [new THREE.Vector3(cX(-8) + 3, -0.6, -8), new THREE.Vector3(cX(-8) + 1, 0.8, -9), new THREE.Vector3(cX(-8) - 1.5, 1.4, -8.6), new THREE.Vector3(cX(-8) - 4, 1.3, -9.4)];
-  const tw = new THREE.Mesh(taperedTube(twig, 8, (t) => mix(0.16, 0.05, t), 1, 1, 4), bark); tw.castShadow = true; S.add(tw);
+  const tw = new THREE.Mesh(taperedTube(twig, 12, (t) => mix(0.16, 0.05, t), 1, 1, 6, 0.1, 4), bark); tw.castShadow = true; S.add(tw);
   // rock island
-  rocks(world, [{ x: cX(-20) + 1, z: -20, s: 1.8, sy: 0.5, sink: 0.55, sx: 1.6 }], { mossy: 0.8, seed: 12 });
-  rocks(world, scatter(40, 9, 120, (x, z) => { const d = Math.abs(x - cX(z)); return d > 5 && d < 14; }).map((p) => ({ ...p, s: p.s * 0.6 })), { mossy: 0.6 });
+  modelInstances(world, 'boulder_01', [{ x: cX(-20) + 1, z: -20, s: 1.7, ry: 0.6, y: -0.35 }], { collide: 'auto', moss: 0.6, tint: 0xa8a8a0, onFail: () => rocks(world, [{ x: cX(-20) + 1, z: -20, s: 1.8, sy: 0.5, sink: 0.55, sx: 1.6 }], { mossy: 0.8, seed: 12 }) });
+  rocksM(world, scatter(50, 9, 120, (x, z) => { const d = Math.abs(x - cX(z)); return d > 5 && d < 14; }), { scale: 0.5, moss: 0.55 });
+  rocksM(world, scatter(10, 98, 80, (x, z) => Math.abs(x - cX(z)) > 13), { id: 'rock_moss_set_01', scale: 0.7, moss: 0.7, tint: 0x9c9e96 });
+  modelInstances(world, 'boulder_01', scatter(4, 99, 80, (x, z) => Math.abs(x - cX(z)) > 14), { scale: 1.5, sink: 0.3, collide: 'auto', moss: 0.9, tint: 0x8e9088 });
+  deadwood(world, 110, (x, z) => Math.abs(x - cX(z)) > 9, 610, { logs: 3, stumps: 4, sticks: 50 });
   // reeds & lily pads
-  clumps(world, scatter(500, 10, 140, (x, z) => { const d = Math.abs(x - cX(z)); return d > 5.8 && d < 9.5; }), { tex: 'reed', color: 0x8a8a6a, w: 0.9, h: 1.5, sway: 0.08 });
-  clumps(world, scatter(500, 11, 140, (x, z) => Math.abs(x - cX(z)) > 9), { tex: 'grass', color: 0x6a7258, w: 0.8, h: 0.55 });
-  ferns(world, scatter(160, 12, 140, (x, z) => Math.abs(x - cX(z)) > 12), { color: 0x6e7a5a, scale: 0.8 });
+  grass(world, scatter(520, 10, 140, (x, z) => { const d = Math.abs(x - cX(z)); return d > 5.8 && d < 9.5; }), { height: [0.9, 1.7], blades: 16, lean: 0.18, spread: 0.14, color: 0xc4bea0, dry: 0.55, sway: 0.06, widthK: 1.4 });
+  grass(world, scatter(800, 11, 140, (x, z) => Math.abs(x - cX(z)) > 9), { height: [0.2, 0.6], blades: 24, color: 0xb0b2a0, dry: 0.4 });
+  // dense fern layer on both banks
+  fernsM(world, scatter(300, 12, 140, (x, z) => Math.abs(x - cX(z)) > 11), { scale: 1.8, tint: 0xa8ae9a });
+  // bank-side shrubs hanging over water
+  modelInstances(world, 'shrub_01', scatter(60, 61, 120, (x, z) => { const d = Math.abs(x - cX(z)); return d > 10 && d < 18; }), { scale: 1.0, tint: 0x8aaa88, wind: [0.05, 0.06], translucent: 0x5a8030, far: 60, sink: 0.06 });
+  modelInstances(world, 'shrub_02', scatter(50, 62, 110, (x, z) => { const d = Math.abs(x - cX(z)); return d > 12; }), { scale: 0.8, tint: 0x7a9870, wind: [0.04, 0.05], translucent: 0x5a7a3a, far: 55, sink: 0.05 });
+  // mossy ground plants at water edge
+  clumps(world, scatter(300, 63, 100, (x, z) => { const d = Math.abs(x - cX(z)); return d > 8 && d < 16; }), { tex: 'fern', color: 0x6a8858, w: 0.45, h: 0.65, sway: 0.1 });
+  // moss tufts on ground
+  modelInstances(world, 'forest_floor_01', scatter(150, 64, 100, (x, z) => Math.abs(x - cX(z)) > 10), { scale: 1.3, tint: 0x909a80, far: 25, cast: false });
+  // ivy at base of trees
+  modelInstances(world, 'ivy_01', scatter(60, 65, 90, (x, z) => Math.abs(x - cX(z)) > 10), { scale: 0.9, tint: 0x6a8858, far: 28, wind: [0.02, 0.01], cast: false });
   const pads = new THREE.InstancedMesh(new THREE.CircleGeometry(0.28, 14, 0.3, 5.9).rotateX(-Math.PI / 2), new THREE.MeshStandardMaterial({ color: 0x3a4a30, roughness: 0.35, side: THREE.DoubleSide }), 140);
   scatter(140, 13, 140, (x, z) => { const d = Math.abs(x - cX(z)); return d > 3.5 && d < 6.5; }).forEach((p, i) => pads.setMatrixAt(i, mat4(p.x, 0.015, p.z, p.ry, p.s)));
   S.add(pads);
@@ -354,8 +408,13 @@ function buildSnow(world) {
   });
   // shrubs and trees
   const off = (x, z) => path.dist(x, z)[0];
-  clumps(world, scatter(700, 33, 130, (x, z) => off(x, z) > 1.7), { tex: 'twigs', color: 0xb0a89e, w: 2.4, h: 2.2, snow: 0.9, sway: 0.03, frost: true });
-  clumps(world, scatter(500, 34, 100, (x, z) => off(x, z) > 1.3), { tex: 'twigs', color: 0xa0988e, w: 1.2, h: 1.1, snow: 1, sway: 0.03, frost: true });
+  clumps(world, scatter(500, 33, 130, (x, z) => off(x, z) > 1.7), { atlas: 'firBare', color: 0x8a847c, w: 1.0, h: 2.0, snow: 0.9, sway: 0.02, frost: true, cards: 5 });
+  clumps(world, scatter(400, 34, 100, (x, z) => off(x, z) > 1.3), { atlas: 'firBare', color: 0x7a746c, w: 0.6, h: 1.0, snow: 1, sway: 0.02, frost: true, cards: 4 });
+  modelInstances(world, 'shrub_02', scatter(60, 37, 110, (x, z) => off(x, z) > 2.4), { scale: 0.55, tint: 0x8a8478, snow: 1, snowThreshold: 0.1, sink: 0.05, far: 60 });
+  modelInstances(world, 'shrub_01', scatter(50, 71, 100, (x, z) => off(x, z) > 3.0), { scale: 0.6, tint: 0x7a7870, snow: 1, snowThreshold: 0.15, sink: 0.05, far: 55 });
+  // snow-laden dry plant clusters
+  modelInstances(world, 'dry_shrub_01', scatter(80, 72, 110, (x, z) => off(x, z) > 2.0), { scale: 0.8, tint: 0x8e8880, snow: 1, snowThreshold: 0.05, far: 50, sink: 0.02 });
+  grass(world, scatter(500, 38, 90, (x, z) => off(x, z) > 1.2), { height: [0.25, 0.6], blades: 14, color: 0xc8bca0, dry: 0.9, snow: 1, frost: true, lean: 0.35 });
   const R = rng(5);
   for (let i = 0; i < 26; i++) {
     const z = -55 + i * 4.3 + R() * 2, side = i % 2 ? 1 : -1;
@@ -365,7 +424,8 @@ function buildSnow(world) {
     branchTree(world, x, z, { seed: 70 + i, height: 6 + R() * 5, trunkR: 0.16 + R() * 0.12, depth: 4, horizontal: 0.1, spread: 0.8, twigs: true, snow: 1, barkColor: 0x5a5450, ry: R() * 6 });
   }
   conifers(world, scatter(140, 35, 160, (x, z) => off(x, z) > 5), { variants: 3, snow: 1, foliageColor: 0x5a6a5a, seed: 31, h: 14, crown: 3.2 });
-  rocks(world, scatter(30, 36, 100, (x, z) => off(x, z) > 2.5), { snow: 1, mossy: 0, color: 0x7a7a7c });
+  rocksM(world, scatter(30, 36, 100, (x, z) => off(x, z) > 2.5), { snow: 1, tint: 0x8a8a8c, scale: 0.6 });
+  deadwood(world, 100, (x, z) => off(x, z) > 3, 620, { snow: 1, logs: 3, stumps: 3, sticks: 0, tint: 0x8a8682 });
   // wooden fence beside the path
   const wood = pbr('wood', [0.5, 1], { color: 0x5a4a3c });
   snowCover(wood, 1, 0.4);
@@ -388,7 +448,8 @@ function buildSnow(world) {
   for (let k = 0; k < 4; k++) B.add(new THREE.BoxGeometry(1.6, 0.04, 0.1), mat4(0, 0.45, -0.18 + k * 0.12), wood);
   for (let k = 0; k < 3; k++) B.add(new THREE.BoxGeometry(1.6, 0.1, 0.03), mat4(0, 0.62 + k * 0.13, 0.26, 0, 1, 1, 1, -0.2), wood);
   for (const sx of [-0.7, 0.7]) { B.add(new THREE.BoxGeometry(0.05, 0.45, 0.5), mat4(sx, 0.22, 0), iron); B.add(new THREE.BoxGeometry(0.05, 0.5, 0.05), mat4(sx, 0.7, 0.27, 0, 1, 1, 1, -0.2), iron); }
-  const bench = new THREE.Group(); bench.position.set(bx, by, bz); bench.rotation.y = ba; B.build(bench); S.add(bench);
+  const bench = new THREE.Group(); bench.position.set(bx, by, bz); bench.rotation.y = ba; S.add(bench);
+  placeModel(world, 'painted_wooden_bench', { x: bx, y: by, z: bz, ry: ba + Math.PI, s: 1.35, snow: 1, snowThreshold: 0.35, tint: 0x9a948c, onFail: () => B.build(bench) });
   bench.updateMatrixWorld(); world.collide(new THREE.BoxGeometry(1.7, 0.5, 0.6), bench.matrixWorld.clone().multiply(mat4(0, 0.25, 0)));
 
   snowfall(world, { count: 8000 });
@@ -525,13 +586,24 @@ function buildAlley(world) {
   });
   // clutter
   const crate = pbr('wood', [0.6, 0.6], { color: 0x5a4a3a });
-  [[-1.5, -10], [1.4, 5], [-1.5, 18]].forEach(([x, cz], i) => {
-    const s = 0.6 + (i % 2) * 0.2;
-    const c = new THREE.Mesh(new RoundedBoxGeometry(s, s, s, 2, 0.03), crate); c.position.set(x, s / 2, cz); c.rotation.y = i; c.castShadow = c.receiveShadow = true; S.add(c);
-    world.collideBox(x, s / 2, cz, s, s, s, i);
+  const wetProp = { tint: 0x9a968e, rough: undefined };
+  // crates, barrels, bins — scanned props
+  [[-1.55, -10, 0.3], [1.45, 5, 2.0], [-1.55, 18, -0.4]].forEach(([x, cz, ry], i) => {
+    placeModel(world, 'wooden_crate_02', { x, y: 0, z: cz, ry, s: 1.05, ...wetProp, collide: 'box', onFail: () => { const c = new THREE.Mesh(new RoundedBoxGeometry(0.7, 0.7, 0.7, 2, 0.03), crate); c.position.set(x, 0.35, cz); c.rotation.y = i; S.add(c); world.collideBox(x, 0.35, cz, 0.7, 0.7, 0.7, i); } });
   });
-  const potM = pbr('stone', 1, { color: 0x7a5a4a });
-  ferns(world, [{ x: -1.6, z: -2 }, { x: 1.55, z: 11 }, { x: -1.6, z: 23 }].map((p) => { const pot = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.2, 0.45, 16), potM); pot.position.set(p.x, 0.22, p.z); S.add(pot); world.collideCyl(p.x, 0, p.z, 0.28, 0.45); return { ...p, y: 0.42, s: 0.6 }; }), { color: 0x6a7a50 });
+  placeModel(world, 'wooden_crate_02', { x: -1.5, y: 0.46, z: -10.1, ry: 1.9, s: 0.85, ...wetProp, collide: 'box' });
+  placeModel(world, 'Barrel_01', { x: 1.55, y: 0, z: -24, ry: 1, s: 1, ...wetProp, collide: 'cyl' });
+  placeModel(world, 'Barrel_01', { x: 1.5, y: 0, z: -23.2, ry: 2.4, s: 0.95, ...wetProp, collide: 'cyl' });
+  placeModel(world, 'metal_trash_can', { x: -1.55, y: 0, z: -4.2, ry: Math.PI / 2, s: 1, ...wetProp, collide: 'box' });
+  placeModel(world, 'metal_trash_can', { x: 1.55, y: 0, z: 22, ry: -Math.PI / 2, s: 1, ...wetProp, collide: 'box' });
+  placeModel(world, 'trashbag', { x: -1.5, y: 0, z: -3.1, ry: 0.4, s: 1, tint: 0x8a8a8a });
+  placeModel(world, 'trashbag', { x: 1.45, y: 0, z: 23.1, ry: 2.2, s: 0.9, tint: 0x8a8a8a });
+  placeModel(world, 'utility_box_01', { x: -2.02, y: 1.3, z: 8.5, ry: Math.PI / 2, s: 1, tint: 0x9a9690 });
+  placeModel(world, 'utility_box_01', { x: 2.02, y: 1.4, z: -16, ry: -Math.PI / 2, s: 1, tint: 0x8a8a86 });
+  // potted plants by the doors
+  [[-1.6, -2], [1.55, 11], [-1.6, 23]].forEach(([x, z], i) => {
+    placeModel(world, 'potted_plant_02', { x, y: 0, z, ry: i * 2, s: 1.15, tint: 0xb0b0a4, wind: [0.02, 0.2], collide: 'cyl', onFail: () => ferns(world, [{ x, z, y: 0.42, s: 0.6 }]) });
+  });
   // heights for ferns sit on pots
   rain(world, { count: 9000, box: 22, opacity: 0.3 });
   mist(world, { count: 30, area: 0, place: () => [(Math.random() - 0.5) * 3, -36 + Math.random() * 72], y: 0.4, size: [4, 9], color: 0x8a8e94, opacity: 0.08, heightVar: 2 });
@@ -607,10 +679,11 @@ function buildLake(world) {
   // boathouse
   buildBoathouse(world, -10, 9, H);
   conifers(world, scatter(170, 62, 200, (x, z) => z > H(x, z) * 0 + 10 && Math.hypot(x + 10, z - 9) > 7 && Math.abs(x) > 3), { variants: 3, foliageColor: 0x6a786a, seed: 41, collideR: 70 });
-  clumps(world, scatter(500, 63, 160, (x, z) => { const y = H(x, z); return y > -0.5 && y < 0.6 && Math.abs(x) > 1.6; }), { tex: 'reed', color: 0x7a7a5a, w: 0.9, h: 1.6, sway: 0.06 });
-  clumps(world, scatter(500, 64, 160, (x, z) => H(x, z) > 0.6), { tex: 'grass', color: 0x5a6448, w: 0.8, h: 0.5 });
-  ferns(world, scatter(160, 65, 160, (x, z) => H(x, z) > 1.5 && Math.hypot(x + 10, z - 9) > 6), { color: 0x6a7a58 });
-  rocks(world, scatter(30, 66, 120, (x, z) => { const y = H(x, z); return y > -0.6 && y < 1.5 && Math.abs(x) > 3; }), { mossy: 0.4 });
+  grass(world, scatter(600, 63, 160, (x, z) => { const y = H(x, z); return y > -0.5 && y < 0.6 && Math.abs(x) > 1.6; }), { height: [0.9, 1.8], blades: 16, lean: 0.15, spread: 0.14, color: 0xb8b498, dry: 0.6, sway: 0.06, widthK: 1.4, near: 55 });
+  grass(world, scatter(900, 64, 160, (x, z) => H(x, z) > 0.6), { height: [0.2, 0.55], blades: 24, color: 0xaab09a, dry: 0.4, near: 50 });
+  fernsM(world, scatter(180, 65, 160, (x, z) => H(x, z) > 1.5 && Math.hypot(x + 10, z - 9) > 6), { scale: 1.8, far: 55 });
+  rocksM(world, scatter(30, 66, 120, (x, z) => { const y = H(x, z); return y > -0.6 && y < 1.5 && Math.abs(x) > 3; }), { scale: 0.55 });
+  deadwood(world, 120, (x, z) => H(x, z) > 0.8 && Math.abs(x) > 3 && Math.hypot(x + 10, z - 9) > 7, 630, { logs: 4, stumps: 4, sticks: 50 });
   mist(world, { count: 60, area: 140, cz: -40, y: 0.2, size: [10, 22], color: 0x8a96a4, opacity: 0.1, heightVar: 0.8 });
   fireflies(world, new THREE.Vector3(0, 0, 8), 50, 50, 0xd8ff90);
   boundary(world, 0, -10, 68);
@@ -733,11 +806,19 @@ function buildGreenhouse(world) {
   const rg = new THREE.ExtrudeGeometry(roof, { depth: L, bevelEnabled: false }); rg.translate(0, 0, -L / 2);
   world.collide(rg);
   // plants on tables
-  const plantPlaces = plantSpots.map((p) => ({ ...p }));
-  const fm = ferns(world, plantPlaces, { color: 0x6e8a58, scale: 1 });
-  plantPlaces.forEach((p, i) => fm.setMatrixAt(i, mat4(p.x, p.y, p.z, i * 1.3, p.s)));
+  const plantPlaces = plantSpots.map((p, i) => ({ ...p, y: p.y - 0.04, ry: i * 1.3 }));
+  const kinds = [['calathea_orbifolia_01', 0.75], ['periwinkle_plant', 2.2], ['anthurium_botany_01', 0.5], ['fern_02', 0.9]];
+  kinds.forEach(([id, sc], k) => {
+    const list = plantPlaces.filter((_, i) => i % kinds.length === k);
+    modelInstances(world, id, list.map((p) => ({ ...p, s: 0.8 + (p.s - 0.35) })), { scale: sc, tint: 0xb4b8a8, wind: [0.01, 0.05], translucent: 0x6a8a3a, onFail: () => ferns(world, list) });
+  });
   // big potted plants on the floor
-  ferns(world, [{ x: -3.4, z: 6.8, s: 1.3 }, { x: 3.4, z: -6.8, s: 1.4 }, { x: 3.3, z: 6.5, s: 1.1 }].map((p) => ({ ...p })), { color: 0x5e7a4c });
+  [[-3.4, 6.8, 'potted_plant_01', 1.3], [3.4, -6.8, 'potted_plant_02', 1.4], [3.3, 6.5, 'potted_plant_01', 1.1], [-3.3, -6.6, 'pachira_aquatica_01', 1.2]].forEach(([x, z, id, s2], i) => {
+    placeModel(world, id, { x, y: 0.15, z, ry: i * 1.7, s: s2, tint: 0xb8b8ac, collide: 'cyl', wind: [0.01, 0.4], onFail: () => ferns(world, [{ x, z, s: s2 }]) });
+  });
+  placeModel(world, 'watering_can_metal_01', { x: -1.1, y: 0.15, z: -5.5, ry: 0.7, s: 1, tint: 0xa8a8a0 });
+  placeModel(world, 'wooden_bucket_01', { x: 1.2, y: 0.15, z: -6.9, ry: 2.1, s: 1, tint: 0xa8a49c, collide: 'cyl' });
+  placeModel(world, 'planter_box_01', { x: 0, y: 0.15, z: -7.35, ry: 0, s: 1.4, tint: 0xa8a49c, collide: 'box' });
   // hanging vines from the roof
   const vineM = cardMat('mossStrand', { color: 0x7a9a5a, alphaTest: 0.3 });
   hangSway(vineM, 0.08);
@@ -768,9 +849,10 @@ function buildGreenhouse(world) {
   });
   // exterior
   conifers(world, scatter(140, 82, 170, (x, z) => Math.hypot(x, z) > 14), { variants: 3, seed: 51, foliageColor: 0x6e7c6a, collideR: 70 });
-  ferns(world, scatter(400, 83, 110, (x, z) => (Math.abs(x) > W / 2 + 0.6 || Math.abs(z) > L / 2 + 0.6) && !(Math.abs(x) < 1.6 && z > L / 2 && z < L / 2 + 8)), { color: 0x6e8258 });
-  clumps(world, scatter(500, 84, 100, (x, z) => Math.abs(x) > W / 2 + 0.3 || Math.abs(z) > L / 2 + 0.3), { tex: 'grass', color: 0x5a6a48, w: 0.8, h: 0.5 });
-  rocks(world, scatter(20, 85, 80, (x, z) => Math.hypot(x, z) > 12), { mossy: 0.7 });
+  fernsM(world, scatter(400, 83, 110, (x, z) => (Math.abs(x) > W / 2 + 0.8 || Math.abs(z) > L / 2 + 0.8) && !(Math.abs(x) < 1.6 && z > L / 2 && z < L / 2 + 8)));
+  grass(world, scatter(900, 84, 100, (x, z) => Math.abs(x) > W / 2 + 0.3 || Math.abs(z) > L / 2 + 0.3), { height: [0.2, 0.55], blades: 24, color: 0xaab29a, dry: 0.3 });
+  rocksM(world, scatter(20, 85, 80, (x, z) => Math.hypot(x, z) > 12));
+  deadwood(world, 90, (x, z) => Math.hypot(x, z) > 12, 640, { logs: 3, stumps: 3, sticks: 40 });
   streetLamp(world, 3.8, L / 2 + 2.5, { y: H(3.8, L / 2 + 2.5), height: 2.6, intensity: 12, distance: 14, color: 0xffb060 });
   { const hl = new THREE.PointLight(0xffa860, 7, 14, 1.8); hl.position.set(0, ridge - 0.9, -1); S.add(hl);
     const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.07, 12, 10), new THREE.MeshBasicMaterial({ color: new THREE.Color(0xffb060).multiplyScalar(6) })); bulb.position.copy(hl.position); S.add(bulb);
@@ -798,6 +880,5 @@ export const SCENES = [
 export function buildScene(index, renderer) {
   const world = new World(renderer);
   SCENES[index].build(world);
-  world.buildOctree();
   return world;
 }
