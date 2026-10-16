@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { U } from './world.js';
+import { PENDING } from './textures.js';
 import { SCENES, buildScene } from './scenes.js';
 import { Post } from './post.js';
 import { Player } from './player.js';
@@ -136,9 +137,19 @@ function resume() {
 }
 
 /* ---------- world management ---------- */
-function loadWorld(i) {
+async function loadWorld(i, onProgress = null) {
+  PENDING.length = 0;
+  let w;
+  try { w = buildScene(i, renderer); } catch(e) { console.error('buildScene failed:', e); throw e; }
+  // wait for scanned models & textures (bounded) so nothing pops in
+  const jobs = [...w.pending, ...PENDING];
+  let done = 0;
+  jobs.forEach((j) => Promise.resolve(j).finally(() => { done++; if (onProgress) onProgress(done / jobs.length); }));
+  await Promise.race([Promise.allSettled(jobs), new Promise((r) => setTimeout(r, 30000))]);
+  await Promise.race([Promise.allSettled([...PENDING]), new Promise((r) => setTimeout(r, 8000))]);
+  w.buildOctree();
   if (world) { world.scene.remove(camera); world.dispose(); }
-  world = buildScene(i, renderer);
+  world = w;
   current = i;
   world.scene.add(camera);
   player.setWorld(world);
@@ -205,8 +216,11 @@ function fadeSwitch(i, fromLanding) {
     if (k < 1) requestAnimationFrame(fadeOut);
     else {
       ui.veil.classList.add('on');
-      setTimeout(() => {
-        try { loadWorld(i); } catch (e) { reportError(e); return; }
+      setTimeout(async () => {
+        document.body.classList.add('loading');
+        try { await loadWorld(i, (k) => { ui.bar.style.transform = `scaleX(${k})`; }); } catch (e) { reportError(e); document.body.classList.remove('loading'); return; }
+        document.body.classList.remove('loading');
+        ui.bar.style.transform = 'scaleX(0)';
         const s = world.spawn;
         const back = new THREE.Vector3(Math.sin(s.yaw), 0, Math.cos(s.yaw)).multiplyScalar(3.5);
         const from = s.pos.clone().add(back).add(new THREE.Vector3(0, 2.6, 0));
@@ -300,7 +314,7 @@ async function boot() {
   ui.bar.style.transform = 'scaleX(0.4)';
   await new Promise((r) => setTimeout(r, 30));
   const hm = /^#s(\d)$/.exec(location.hash);
-  loadWorld(hm ? Math.min(+hm[1], SCENES.length - 1) : 0);
+  await loadWorld(hm ? Math.min(+hm[1], SCENES.length - 1) : 0, (k) => { ui.bar.style.transform = `scaleX(${0.4 + k * 0.6})`; });
   ui.bar.style.transform = 'scaleX(1)';
   state = 'landing';
   post.extraBlur = 1.1;
