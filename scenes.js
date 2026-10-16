@@ -398,7 +398,7 @@ function buildSnow(world) {
   world.spawn = { pos: new THREE.Vector3(sp.x, H(sp.x, sp.z) + 0.2, sp.z), yaw: Math.atan2(-tg.x, -tg.z), pitch: 0.05 };
   world.surface = () => 'snow';
   world.ambience = { hush: 0.6, wind: 0.18 };
-  world.tweak = { exposure: 0.95, bloom: 1.1 };
+  world.tweak = { exposure: 1.1, bloom: 1.1 };
 }
 
 /* =========================================================
@@ -430,7 +430,7 @@ function buildAlley(world) {
     st.position.set(0, (i + 0.5) * 0.1625, 28 + i * 0.375 + 0.2); st.receiveShadow = st.castShadow = true; S.add(st);
   }
   // puddles
-  const pudM = new THREE.MeshStandardMaterial({ color: 0x0e1012, roughness: 0.02, metalness: 0.1, transparent: true, opacity: 0.85, polygonOffset: true, polygonOffsetFactor: -2 });
+  const pudM = new THREE.MeshStandardMaterial({ color: 0x0e1012, roughness: 0.02, metalness: 0.1, transparent: true, opacity: 0.7, polygonOffset: true, polygonOffsetFactor: -2 });
   wetRipples(pudM, 2.0, 2.4);
   const R = rng(44);
   for (let i = 0; i < 14; i++) {
@@ -440,7 +440,7 @@ function buildAlley(world) {
   // buildings
   const plaster = pbr('plaster', [1, 1], { color: 0x8a8278 }, 'painted_plaster_wall');
   const plaster2 = pbr('plaster', [1, 1], { color: 0x6e7476 });
-  const brick = pbr('brick', [1, 1], { color: 0x9a8a80 }, 'red_brick_03');
+  const brick = pbr('brick', [2.5, 2.5], { color: 0x9a8a80 }, 'red_brick_03');
   const trim = pbr('stone', [1, 1], { color: 0x6a6660 });
   const darkWood = pbr('wood', [1, 1], { color: 0x2e2620 });
   const iron = pbr('metal', 1, { color: 0x2a2b2d, metalness: 0.8, roughness: 0.45 });

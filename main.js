@@ -111,7 +111,7 @@ canvas.addEventListener('touchend', () => (lastTouch = null));
 function lock() {
   try {
     const p = canvas.requestPointerLock({ unadjustedMovement: true });
-    if (p && p.catch) p.catch(() => { try { canvas.requestPointerLock(); } catch (e) { } });
+    if (p && p.catch) p.catch(() => { try { const q = canvas.requestPointerLock(); if (q && q.catch) q.catch(() => {}); } catch (e) { } });
   } catch (e) { try { canvas.requestPointerLock(); } catch (e2) { } }
 }
 document.addEventListener('pointerlockchange', () => {
